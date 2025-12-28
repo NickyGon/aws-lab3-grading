@@ -1,0 +1,75 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: S3 -> Ingest Lambda -> SQS -> Metadata Lambda -> S3, loop prevention, no circular deps.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Architectures: [x86_64]
+    Tracing: Active
+
+Resources:
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub images-${AWS::AccountId}-${AWS::Region}-${AWS::StackName}
+  
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.ingest_handler
+      Environment:
+        Variables:
+          INPUT_PREFIX: incoming/
+          QUEUE_URL: !Ref ProcessingQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt ProcessingQueue.QueueName
+      Events:
+        ImageUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref ImagesBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+  
+  MetadataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.metadata_handler
+      Environment:
+        Variables:
+          INPUT_PREFIX: incoming/
+          OUTPUT_PREFIX: metadata/
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ImagesBucket
+        - SQSPollerPolicy:
+            QueueName: !GetAtt ProcessingQueue.QueueName
+      Events:
+        FromSQS:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ProcessingQueue.Arn
+            BatchSize: 5
+
+Outputs:
+  BucketName:
+    Description: S3 bucket for incoming images and generated metadata
+    Value: !Ref ImagesBucket
+  QueueUrl:
+    Description: SQS queue URL used to decouple ingestion and processing
+    Value: !Ref ProcessingQueue
